@@ -1,0 +1,19 @@
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# IDE 配置
+.vscode/
+.idea/
+
+# ONNX Runtime 依赖库
+onnxruntime-win-x64-1.28.3/
+bin/
+
+# 临时文档或杂项
+*.docx
+*.tmp
