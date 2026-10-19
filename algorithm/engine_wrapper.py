@@ -1,104 +1,197 @@
-import subprocess
+"""Piskvork/Rapfi process wrapper used by the BotArena adapter."""
+
+from __future__ import annotations
+
 import os
-import select
+import platform
+import queue
+import re
+import subprocess
+import threading
 import time
-from typing import List, Tuple, Optional
+from pathlib import Path
+from typing import Iterable, Sequence
+
+
+BOARD_SIZE = 15
+DEFAULT_TIMEOUT_MS = int(os.getenv("RAPFI_TIMEOUT_TURN", "6000"))
+READ_EXTRA_SEC = float(os.getenv("RAPFI_READ_EXTRA_SEC", "1"))
+_COORDINATE = re.compile(r"^\s*(-?\d+)\s*,\s*(-?\d+)\s*$")
+
+
+def _find_engine(engine_path: str | None) -> str:
+    candidates: list[Path] = []
+    if engine_path:
+        candidates.append(Path(engine_path))
+    configured = os.getenv("RAPFI_ENGINE_PATH")
+    if configured:
+        candidates.append(Path(configured))
+
+    root = Path(__file__).resolve().parents[1]
+    candidates.extend(
+        [
+            root / "bin" / "rapfi",
+            root / "gomoku-rapfi" / "Rapfi-engine" / "pbrain-rapfi-windows-sse.exe",
+            root / "gomoku-rapfi" / "Rapfi-engine" / "pbrain-rapfi-linux-clang-sse",
+        ]
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    searched = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(f"Rapfi Piskvork 引擎未找到，已搜索: {searched}")
 
 
 class RapfiEngine:
-    """通过 Pipe 管理 C++ Rapfi 进程的 CLI/GTP 通信包装类"""
+    """Manage one Rapfi engine using the Piskvork protocol.
 
-    def __init__(self, engine_path: str = "bin/rapfi", model_path: str = "bin/model.onnx"):
-        if not os.path.exists(engine_path):
-            raise FileNotFoundError(f"Rapfi 可执行文件未找到: {engine_path}")
+    ``player=1`` means the engine's own side and ``player=2`` means the
+    opponent.  This is deliberately independent of seat number and supports
+    BotArena's post-swap color change.
+    """
 
-        cmd = [engine_path, "--model", model_path]
+    def __init__(
+        self,
+        engine_path: str | None = None,
+        model_path: str | None = None,
+        timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    ) -> None:
+        del model_path  # Rapfi loads its model/config from its own directory.
+        self.path = _find_engine(engine_path)
+        self.timeout_ms = max(100, int(timeout_ms))
+        self.lock = threading.Lock()
+        self.process: subprocess.Popen[str] | None = None
+        self._start()
+
+    def _start(self) -> None:
         self.process = subprocess.Popen(
-            cmd,
+            [self.path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
-            bufsize=1
+            bufsize=1,
         )
+        self._send(f"START {BOARD_SIZE}")
+        self._drain_startup()
+        self._send("INFO rule 4")
+        self._send(f"INFO timeout_turn {self.timeout_ms}")
 
-    def send_command(self, cmd: str) -> List[str]:
-        """向 Rapfi 发送指令并同步获取响应文本行"""
-        if self.process.poll() is not None:
-            raise RuntimeError("Rapfi 引擎进程已异常退出")
+    def restart(self) -> None:
+        self.terminate()
+        self._start()
 
-        self.process.stdin.write(cmd.strip() + "\n")
+    def _send(self, command: str) -> None:
+        if self.process is None or self.process.stdin is None:
+            raise RuntimeError("Rapfi 引擎管道未启动")
+        self.process.stdin.write(command + "\n")
         self.process.stdin.flush()
 
-        response = []
-        while True:
-            line = self.process.stdout.readline()
-            if not line or line.strip() == "OK" or line.startswith("error"):
-                if line and line.startswith("error"):
-                    raise RuntimeError(f"Rapfi 执行报错: {line.strip()}")
+    def _drain_startup(self, max_lines: int = 50, max_seconds: float = 1.0) -> None:
+        if self.process is None or self.process.stdout is None:
+            return
+        started = time.monotonic()
+        for _ in range(max_lines):
+            if time.monotonic() - started > max_seconds:
                 break
-            response.append(line.strip())
-        return response
+            line = self.process.stdout.readline()
+            if not line:
+                break
+            if line.strip().upper() == "OK":
+                break
 
-    def sync_board(self, moves_history: List[Tuple[int, int]]):
-        """重置并同步当前盘面历史落子"""
-        self.send_command("boardsize 15")
-        self.send_command("clear_board")
-        for x, y in moves_history:
-            self.send_command(f"play {x} {y}")
+    def _read_best_move(self) -> tuple[int, int]:
+        if self.process is None or self.process.stdout is None:
+            raise RuntimeError("Rapfi 引擎管道未启动")
+        deadline = time.monotonic() + self.timeout_ms / 1000.0 + READ_EXTRA_SEC
+        last = ""
+        while time.monotonic() < deadline:
+            line = self.process.stdout.readline()
+            if line == "":
+                raise RuntimeError(f"Rapfi 引擎提前退出，最后输出: {last!r}")
+            line = line.strip()
+            if not line:
+                continue
+            last = line
+            match = _COORDINATE.match(line)
+            if match:
+                x, y = int(match.group(1)), int(match.group(2))
+                if 0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE:
+                    return x, y
+                raise RuntimeError(f"Rapfi 返回越界坐标: {x},{y}")
+        raise TimeoutError(f"Rapfi 超时，最后输出: {last!r}")
 
-    def evaluate_position(
-            self,
-            moves_history: List[Tuple[int, int]],
-            eval_player: str = "black",
-            time_limit_ms: int = 100
-    ) -> float:
-        """
-        评估当前盘面相对某方的胜率胜值 [0.0, 1.0]
-        :return: 黑棋胜率 (0.0~1.0)
-        """
-        self.sync_board(moves_history)
-        res = self.send_command(f"eval timeout {time_limit_ms}")
-        # 假设 Rapfi 返回格式: winrate 0.5432
-        for line in res:
-            if "winrate" in line:
-                val = float(line.split()[-1])
-                return val if eval_player == "black" else 1.0 - val
-        return 0.5
-
-    def get_top_n_moves(
-            self,
-            moves_history: List[Tuple[int, int]],
-            top_n: int = 2,
-            time_limit_ms: int = 200
-    ) -> List[Tuple[int, int]]:
-        """调用 Policy / MCTS 根节点输出评分最高的 Top N 个落子坐标"""
-        self.sync_board(moves_history)
-        res = self.send_command(f"get_policy top {top_n} timeout {time_limit_ms}")
-        # 假设 Rapfi 返回格式每行为: x y score
-        candidates = []
-        for line in res:
-            parts = line.split()
-            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-                candidates.append((int(parts[0]), int(parts[1])))
-        return candidates[:top_n]
+    @staticmethod
+    def _normalize_move(move: Sequence[int]) -> tuple[int, int, int | None]:
+        if len(move) == 2:
+            return int(move[0]), int(move[1]), None
+        if len(move) >= 3:
+            return int(move[0]), int(move[1]), int(move[2])
+        raise ValueError(f"invalid move: {move!r}")
 
     def search_best_move(
-            self,
-            moves_history: List[Tuple[int, int]],
-            time_limit_ms: int
-    ) -> Tuple[int, int]:
-        """进行 MCTS 深算并输出最佳落子坐标"""
-        self.sync_board(moves_history)
-        res = self.send_command(f"genmove timeout {time_limit_ms}")
-        # 假设 Rapfi 返回格式: move x y
-        for line in res:
-            parts = line.split()
-            if len(parts) >= 3 and parts[0] == "move":
-                return int(parts[1]), int(parts[2])
-        raise RuntimeError("Rapfi 未能在时限内输出有效落子")
+        self,
+        moves_history: Iterable[Sequence[int]],
+        time_limit_ms: int,
+        own_color: int = 0,
+    ) -> tuple[int, int]:
+        """Return a move from a history of ``(x, y, color)`` entries."""
+        moves = list(moves_history)
+        with self.lock:
+            try:
+                self._send("BOARD")
+                for index, move in enumerate(moves):
+                    x, y, color = self._normalize_move(move)
+                    if not (0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE):
+                        raise ValueError(f"move out of bounds: {x},{y}")
+                    if color in (0, 1):
+                        player = 1 if color == own_color else 2
+                    else:
+                        player = 1 if index % 2 == 0 else 2
+                    self._send(f"{x},{y},{player}")
+                self._send("DONE")
+                return self._read_best_move()
+            except Exception:
+                self.restart()
+                raise
 
-    def terminate(self):
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            self.process.wait()
+    def get_top_n_moves(
+        self,
+        moves_history: Iterable[Sequence[int]],
+        top_n: int = 2,
+        time_limit_ms: int = 200,
+    ) -> list[tuple[int, int]]:
+        """Return deterministic legal candidates for the five-move phase.
+
+        Rapfi's Piskvork protocol has no portable ``get_policy`` command.  The
+        rule layer supplies the official two-point candidate list instead.
+        This method remains as a compatibility helper for callers outside the
+        BotArena adapter.
+        """
+        del time_limit_ms
+        occupied = {(int(move[0]), int(move[1])) for move in moves_history}
+        result: list[tuple[int, int]] = []
+        for x, y in ((0, 0), (14, 14), (0, 14), (14, 0), (1, 13)):
+            if (x, y) not in occupied:
+                result.append((x, y))
+            if len(result) >= top_n:
+                break
+        return result
+
+    def evaluate_position(self, *args, **kwargs) -> float:
+        raise NotImplementedError("Rapfi Piskvork 接口不提供 eval 命令")
+
+    def terminate(self) -> None:
+        process = self.process
+        self.process = None
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+            except OSError:
+                pass

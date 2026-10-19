@@ -1,8 +1,17 @@
-class TimeManager:
-    """根据包干剩余用时动态计算单步思考上限"""
+import os
 
-    def __init__(self, total_budget_sec: float = 900.0, safety_margin_sec: float = 10.0):
-        self.total_budget = total_budget_sec
+
+class TimeManager:
+    """Calculate a bounded per-turn budget from BotArena's side clock."""
+
+    def __init__(
+        self,
+        total_budget_sec: float | None = None,
+        safety_margin_sec: float = 10.0,
+    ):
+        self.total_budget = total_budget_sec or float(
+            os.getenv("BOTARENA_TOTAL_TIME_SEC", "900")
+        )
         self.safety_margin = safety_margin_sec
         self.estimated_moves_left = 30  # 五子棋中盘平均剩余有效棋步估算
 
@@ -22,6 +31,7 @@ class TimeManager:
         if 6 <= current_move_index <= 20:
             allocated_sec *= 1.5
 
-        # 约束在 [100ms, 15000ms] 范围内
+        # Keep the local engine below its default 6000 ms turn setting and
+        # leave time for JSON/process overhead.
         allocated_ms = int(allocated_sec * 1000)
-        return max(100, min(15000, allocated_ms))
+        return max(100, min(5500, allocated_ms))

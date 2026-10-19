@@ -1,38 +1,71 @@
-import sys
+"""BotArena Gomoku Traditional Bot entrypoint."""
+
+from __future__ import annotations
+
 import json
-from algorithm.engine_wrapper import RapfiEngine
+import os
+import sys
+import traceback
+from typing import Any
+
 from algorithm.ccgc_rules import CCGCRuleHandler
+from algorithm.engine_wrapper import RapfiEngine
 from algorithm.time_manager import TimeManager
 from botbattle.adapter import BotBattleAdapter
 
-def main():
-    # 初始化核心组件
-    engine = RapfiEngine(engine_path="bin/rapfi", model_path="bin/model.onnx")
-    rule_handler = CCGCRuleHandler(engine)
-    time_manager = TimeManager(total_budget_sec=900.0)
-    adapter = BotBattleAdapter(rule_handler, time_manager)
 
+def _request_phase(data: dict[str, Any]) -> str:
+    requests = data.get("requests", [])
+    if isinstance(requests, list) and requests and isinstance(requests[-1], dict):
+        value = requests[-1].get("phase", data.get("phase", "normal_play"))
+        return value if isinstance(value, str) else "normal_play"
+    return "normal_play"
+
+
+def main() -> int:
+    # Traditional mode sends one complete history and expects one response.
+    raw_line = sys.stdin.buffer.readline()
+    if not raw_line:
+        return 0
+
+    engine: RapfiEngine | None = None
     try:
-        # 持续读取 stdin JSON 事件
-        for line in sys.stdin:
-            line_str = line.strip()
-            if not line_str:
-                continue
+        data = json.loads(raw_line.decode("utf-8", errors="strict"))
+        phase = _request_phase(data)
 
-            event = json.loads(line_str)
-            response = adapter.process_event(event)
+        # Opening/swap/five-move decisions do not need the engine.  Delaying
+        # startup makes the platform's first-turn precheck deterministic.
+        if phase in {"white4", "normal_play"}:
+            try:
+                engine = RapfiEngine(
+                    engine_path=os.getenv("RAPFI_ENGINE_PATH"),
+                    timeout_ms=int(os.getenv("RAPFI_TIMEOUT_TURN", "6000")),
+                )
+            except (FileNotFoundError, OSError) as exc:
+                # A Python source upload is allowed to run without native
+                # binaries.  The adapter then uses its legal pure-Python
+                # fallback; local Windows runs still use Rapfi automatically.
+                sys.stderr.write(f"Rapfi unavailable, using safe fallback: {exc}\n")
 
-            # 当需要做出落子/决策响应时，向 stdout 输出格式化 JSON
-            if response is not None:
-                sys.stdout.write(json.dumps(response) + "\n")
-                sys.stdout.flush()
-
-    except Exception as e:
-        sys.stderr.write(f"Fatal Engine Exception: {str(e)}\n")
+        adapter = BotBattleAdapter(
+            CCGCRuleHandler(engine),
+            TimeManager(),
+        )
+        response = adapter.process_request(data)
+        sys.stdout.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        return 0
+    except Exception as exc:
+        # Never put diagnostics on stdout: the platform treats every stdout
+        # line as protocol data.  A missing response is a clear Bot failure.
+        sys.stderr.write(f"Bot error: {exc}\n")
+        traceback.print_exc(file=sys.stderr)
         sys.stderr.flush()
-        sys.exit(1)
+        return 1
     finally:
-        engine.terminate()
+        if engine is not None:
+            engine.terminate()
+
 
 if __name__ == "__main__":
-    main()
+        raise SystemExit(main())

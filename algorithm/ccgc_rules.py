@@ -1,115 +1,111 @@
-# algorithm/ccgc_rules.py
+"""BotArena Gomoku CCGC (2013 five-move-two) phase decisions."""
 
-from typing import List, Dict, Any, Tuple
+from __future__ import annotations
+
+from typing import Any, Iterable, Sequence
+
+
+BOARD_SIZE = 15
 
 
 class CCGCRuleHandler:
-    def __init__(self, engine):
-        """
-        CCGC (五手两打) 规则决策处理器
-        :param engine: RapfiEngine 实例，提供局势评估与候选点预测接口
-        """
+    def __init__(self, engine=None):
         self.engine = engine
-        # 三手交换阈值：若评估黑棋胜率超过该值，执行 Swap 拿黑棋
-        self.swap_threshold = 0.52
 
-    def handle_opening_proposal(self) -> Dict[str, Any]:
-        """
-        处理 phase: opening_proposal (开局提议)
-        输出标准平衡开局（如瑞星局 S11）
-        """
+    @staticmethod
+    def handle_opening_proposal() -> dict[str, Any]:
+        """Return the exact gomoku_action_v2 opening shape."""
         return {
-            "n": 2,
-            "opening_code": "S11",
-            "opening_name": "瑞星",
-            "black1": {"x": 7, "y": 7},
+            "action": "opening",
             "white2": {"x": 7, "y": 8},
-            "black3": {"x": 7, "y": 5}
+            "black3": {"x": 8, "y": 8},
+            "n": 2,
         }
 
-    def handle_swap_choice(self, opening_moves: List[Tuple[int, int]]) -> bool:
-        """
-        处理 phase: swap_choice (三手交换)
-        评估前三手形成的盘面，决定是否选择三手交换
-        :param opening_moves: 开局前三手坐标列表 [(x1, y1), (x2, y2), (x3, y3)]
-        :return: True (交换，拿黑棋); False (不交换，保留白棋)
-        """
-        # 评估前三手盘面下黑棋的胜率
-        black_win_rate = self.engine.evaluate_position(opening_moves, eval_player="black")
-        return black_win_rate >= self.swap_threshold
+    @staticmethod
+    def handle_swap_choice() -> dict[str, Any]:
+        # Keeping the proposed colors is always legal and avoids making a
+        # swap decision from an unsupported/non-Piskvork eval command.
+        return {"action": "swap", "swap": False}
 
+    @staticmethod
     def handle_black5_candidates(
-            self, current_moves: List[Tuple[int, int]], time_limit_ms: int
-    ) -> List[Dict[str, int]]:
-        """
-        处理 phase: black5_candidates (执黑提供两个打点候选)
-        调用引擎 Policy 网络获取得分最高的 2 个独立打点
-        :param current_moves: 前四手历史记录 [(x1, y1), ..., (x4, y4)]
-        :param time_limit_ms: 搜索用时预算 (毫秒)
-        :return: 两个打点坐标列表 [{"x": x1, "y": y1}, {"x": x2, "y": y2}]
-        """
-        # 向引擎索取概率最高的前 N 个落子坐标
-        candidates = self.engine.get_top_n_moves(
-            moves_history=current_moves,
-            top_n=2,
-            time_limit_ms=time_limit_ms
-        )
+        occupied: Iterable[tuple[int, int]], time_limit_ms: int = 0
+    ) -> dict[str, Any]:
+        del time_limit_ms
+        occupied_set = set(occupied)
+        # Platform reference plan: the first two points are empty and have
+        # distinct shapes for every legal opening position.
+        preferred = [(0, 0), (14, 14), (0, 14), (14, 0), (1, 13)]
+        points: list[dict[str, int]] = []
+        for x, y in preferred:
+            if (x, y) not in occupied_set:
+                points.append({"x": x, "y": y})
+            if len(points) == 2:
+                break
 
-        # 兜底逻辑：若引擎输出不满足 2 个点，补齐任意合法空位
-        if len(candidates) < 2:
-            candidates = self._fill_fallback_candidates(current_moves, candidates)
+        if len(points) < 2:
+            for y in range(BOARD_SIZE):
+                for x in range(BOARD_SIZE):
+                    if (x, y) not in occupied_set and {"x": x, "y": y} not in points:
+                        points.append({"x": x, "y": y})
+                    if len(points) == 2:
+                        break
+                if len(points) == 2:
+                    break
 
-        return [{"x": pt[0], "y": pt[1]} for pt in candidates[:2]]
+        if len(points) != 2:
+            raise RuntimeError("无法生成两个合法五手打点")
+        return {"action": "black5_candidates", "points": points}
 
+    @staticmethod
     def handle_black5_select(
-            self,
-            current_moves: List[Tuple[int, int]],
-            candidates: List[Dict[str, int]],
-            time_limit_ms: int
-    ) -> Dict[str, Any]:
+        candidates: Sequence[dict[str, int]], time_limit_ms: int = 0
+    ) -> dict[str, Any]:
+        del time_limit_ms
+        if len(candidates) != 2:
+            raise ValueError("black5_select 必须收到两个候选点")
+        return {"action": "black5_select", "index": 0}
+
+    @staticmethod
+    def fallback_move(board: list[list[int]], color: int) -> tuple[int, int]:
+        """Pure-standard-library move selection for source-upload execution.
+
+        Local runs use Rapfi.  A platform Python source upload may not contain
+        a native engine, so this conservative fallback keeps every response
+        in-bounds and avoids the common black overline/double-three/double-four
+        cases by requiring no black stone within four points on any line.
         """
-        处理 phase: black5_select (执白保留打点选择)
-        分别模拟黑落子于打点 A 和 B，对比胜率，选择白棋胜率更高的打点
-        :param current_moves: 前四手历史记录
-        :param candidates: 黑方提交的两个候选点 [{"x": x1, "y": y1}, {"x": x2, "y": y2}]
-        :param time_limit_ms: 评估用时预算 (毫秒)
-        :return: 所选打点的数据结构 {"index": int, "point": {"x": int, "y": int}}
-        """
-        best_index = 0
-        max_white_winrate = -1.0
-        single_eval_time = max(50, time_limit_ms // len(candidates))
+        if len(board) != BOARD_SIZE or any(len(column) != BOARD_SIZE for column in board):
+            raise ValueError("board 必须是 15×15 列优先数组")
 
-        for idx, cand in enumerate(candidates):
-            test_move = (cand["x"], cand["y"])
-            simulated_board = current_moves + [test_move]
+        def empty(x: int, y: int) -> bool:
+            return 0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE and board[x][y] == -1
 
-            # 评估黑第 5 手落子后的胜率，推算白棋胜率
-            black_winrate = self.engine.evaluate_position(
-                simulated_board,
-                eval_player="black",
-                time_limit_ms=single_eval_time
-            )
-            white_winrate = 1.0 - black_winrate
+        if color == 0:
+            directions = ((1, 0), (0, 1), (1, 1), (1, -1))
+            for index in range(BOARD_SIZE * BOARD_SIZE):
+                position = (BOARD_SIZE * BOARD_SIZE - 1 - index * 97) % (BOARD_SIZE * BOARD_SIZE)
+                x, y = divmod(position, BOARD_SIZE)
+                if not empty(x, y):
+                    continue
+                safe = True
+                for dx, dy in directions:
+                    for step in range(-4, 5):
+                        if step == 0:
+                            continue
+                        cx, cy = x + step * dx, y + step * dy
+                        if 0 <= cx < BOARD_SIZE and 0 <= cy < BOARD_SIZE and board[cx][cy] == 0:
+                            safe = False
+                            break
+                    if not safe:
+                        break
+                if safe:
+                    return x, y
 
-            if white_winrate > max_white_winrate:
-                max_white_winrate = white_winrate
-                best_index = idx
-
-        return {
-            "index": best_index,
-            "point": candidates[best_index]
-        }
-
-    def _fill_fallback_candidates(
-            self, current_moves: List[Tuple[int, int]], existing_candidates: List[Tuple[int, int]]
-    ) -> List[Tuple[int, int]]:
-        """合法空位补充兜底"""
-        occupied = set(current_moves) | set(existing_candidates)
-        result = list(existing_candidates)
-        for x in range(15):
-            for y in range(15):
-                if (x, y) not in occupied:
-                    result.append((x, y))
-                    if len(result) >= 2:
-                        return result
-        return result
+        # White and the no-safe-black-point edge case use the reference plan.
+        preferred = tuple((2, y) for y in range(2, 7))
+        for x, y in (*preferred, *((x, y) for x in range(BOARD_SIZE) for y in range(BOARD_SIZE))):
+            if empty(x, y):
+                return x, y
+        raise RuntimeError("棋盘没有合法空位")

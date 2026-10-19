@@ -1,50 +1,38 @@
+"""Feed one BotArena Traditional request envelope to main.py."""
+
+from __future__ import annotations
+
 import json
 import subprocess
 import sys
+from pathlib import Path
+from typing import Any
 
 
-def run_mock_test(log_filepath: str):
-    """
-    加载真实 JSON 比赛日志，模拟 BotBattle 平台逐行喂入 main.py 验证响应
-    """
-    with open(log_filepath, "r", encoding="utf-8") as f:
-        log_data = json.load(f)
+def run_mock_test(log_filepath: str) -> None:
+    payload: Any = json.loads(Path(log_filepath).read_text(encoding="utf-8"))
+    if isinstance(payload, dict) and "input" in payload:
+        payload = payload["input"]
+    if not isinstance(payload, dict) or not isinstance(payload.get("requests"), list):
+        raise ValueError("mock 文件必须是 BotArena Traditional requests/responses 信封")
 
-    events = log_data["replay"]["events"]
-
-    # 启动 main.py 子进程
-    proc = subprocess.Popen(
+    proc = subprocess.run(
         [sys.executable, "main.py"],
-        stdin=subprocess.PIPE,
+        input=json.dumps(payload, ensure_ascii=False) + "\n",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        bufsize=1
+        timeout=30,
     )
-
-    print(f"--- 开始 Mock 测试: {log_filepath} ---")
-    for idx, event in enumerate(events):
-        event_str = json.dumps(event)
-        proc.stdin.write(event_str + "\n")
-        proc.stdin.flush()
-
-        # 当事件为 turn 且轮到 Bot 行棋时，断言输出有效 JSON
-        if event.get("type") == "turn":
-            out_line = proc.stdout.readline()
-            if out_line:
-                response = json.loads(out_line)
-                print(f"[Event {idx}] Phase: {event.get('phase')} -> Output: {response}")
-            else:
-                err = proc.stderr.read()
-                print(f"[Error at Event {idx}]: {err}")
-                break
-
-    proc.terminate()
-    print("--- Mock 测试完成 ---")
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "main.py returned a failure")
+    response = json.loads(proc.stdout)
+    if not isinstance(response, dict) or not isinstance(response.get("response"), dict):
+        raise AssertionError(f"invalid BotArena response: {response!r}")
+    print(f"phase={payload['requests'][-1].get('phase')} -> {response}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        run_mock_test(sys.argv[1])
-    else:
-        print("用法: python tests/mock_match.py <path_to_match_log.json>")
+    if len(sys.argv) != 2:
+        raise SystemExit("用法: python tests/mock_match.py <traditional_request.json>")
+    run_mock_test(sys.argv[1])
